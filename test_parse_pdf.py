@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -8,7 +10,7 @@ import numpy as np
 import pymupdf
 
 from parse_pdf import (OCR, ROOT, clean_field_text, parse, read_checkbox,
-                       select_template, usable_text)
+                       select_template, to_answers, usable_text)
 
 
 class CheckboxTests(unittest.TestCase):
@@ -60,6 +62,43 @@ class NoOCR:
         raise AssertionError('This generated PDF should be readable without OCR')
 
 
+class AnswerFormatTests(unittest.TestCase):
+    def test_text_single_multiple_and_empty_answers(self):
+        data = {'source_file': 'example.pdf', 'sections': [{
+            'title': 'Контактные данные',
+            'fields': [
+                {'label': 'Контактное лицо', 'type': 'text', 'value': 'Иванов Иван'},
+                {'label': 'Какой LDAP-каталог используется?', 'type': 'checkboxes',
+                 'value': ['ActiveDirectory'], 'reading': {'method': 'checkbox_pixels'}},
+                {'label': 'Какие версии Windows используются?', 'type': 'checkboxes',
+                 'value': ['11', 'Server 2019']},
+                {'label': 'Email', 'type': 'text', 'value': None},
+                {'label': 'Какой VPN?', 'type': 'checkboxes', 'value': None},
+            ],
+        }]}
+        self.assertEqual(to_answers(data), {
+            'Контактное лицо': 'Иванов Иван',
+            'Какой LDAP-каталог используется?': 'ActiveDirectory',
+            'Какие версии Windows используются?': ['11', 'Server 2019'],
+            'Email': None,
+            'Какой VPN?': None,
+        })
+
+    def test_same_question_in_two_sections_keeps_both_answers(self):
+        data = {'sections': [
+            {'title': 'Инфраструктура', 'fields': [
+                {'label': 'Когда подготовите тестовую среду?', 'type': 'text',
+                 'value': '01.02.2026'}]},
+            {'title': 'Установка On-prem', 'fields': [
+                {'label': 'Когда подготовите тестовую среду?', 'type': 'text',
+                 'value': None}]},
+        ]}
+        self.assertEqual(to_answers(data), {
+            'Когда подготовите тестовую среду? (Инфраструктура)': '01.02.2026',
+            'Когда подготовите тестовую среду? (Установка On-prem)': None,
+        })
+
+
 class LayoutTests(unittest.TestCase):
     def make_form(self, directory, template_name, title):
         template_path = ROOT / 'templates' / template_name
@@ -107,6 +146,37 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(actual['page_count'], 3)
         self.assertEqual(actual['extraction']['template'], 'cloud.json')
         self.assertEqual(actual['extraction']['review'], [])
+
+    def test_cli_defaults_to_plain_question_answer_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.make_form(folder, 'onprem.json', 'On-prem')
+            output = Path(folder) / 'answers.json'
+            result = subprocess.run([sys.executable, str(ROOT / 'parse_pdf.py'),
+                                     str(source), '-o', str(output)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(output.read_text(encoding='utf-8'))
+        self.assertEqual(len(data), 42)
+        self.assertEqual(data['Дата заполнения'], '01.02.2026')
+        self.assertEqual(data['Какие версии Windows используются?'], '10')
+        self.assertIsNone(data['Контактное лицо'])
+        self.assertNotIn('sections', data)
+        self.assertNotIn('extraction', data)
+
+    def test_cli_detailed_format_is_still_available(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.make_form(folder, 'cloud.json', 'Cloud')
+            output = Path(folder) / 'detailed.json'
+            result = subprocess.run([sys.executable, str(ROOT / 'parse_pdf.py'),
+                                     str(source), '-o', str(output),
+                                     '--detailed', '--no-page-text'],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(output.read_text(encoding='utf-8'))
+        self.assertEqual(data['page_count'], 3)
+        self.assertEqual(data['extraction']['template'], 'cloud.json')
+        self.assertEqual(data['extraction']['review'], [])
+        self.assertIn('reading', data['sections'][0]['fields'][0])
 
     def test_page_count_alone_does_not_select_a_template(self):
         class UnknownTitle:

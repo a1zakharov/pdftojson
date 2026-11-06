@@ -2,6 +2,7 @@
 """Read a questionnaire locally using a layout template, OCR and pixels."""
 
 import argparse
+from collections import Counter
 import copy
 import json
 from pathlib import Path
@@ -246,6 +247,26 @@ def parse(source, template_path, ocr, include_page_text=True):
     return result
 
 
+def to_answers(data):
+    """Export every field as a readable question/value pair without diagnostics."""
+    counts = Counter(field['label'] for section in data['sections']
+                     for field in section['fields'])
+    answers = {}
+    for section in data['sections']:
+        for field in section['fields']:
+            key = field['label']
+            if counts[key] > 1:
+                key = f"{key} ({section['title']})"
+            if key in answers:
+                raise ValueError(f'Повторяющееся название поля: {key}. '
+                                 'Уточните названия в шаблоне.')
+            value = field['value']
+            if field['type'] == 'checkboxes' and value is not None:
+                value = value[0] if len(value) == 1 else value or None
+            answers[key] = value
+    return answers
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('pdf', type=Path)
@@ -256,23 +277,34 @@ def main():
     local_models = ROOT / '.tessdata'
     parser.add_argument('--tessdata', type=Path,
                         default=local_models if local_models.is_dir() else None)
+    parser.add_argument('--detailed', action='store_true',
+                        help='Сохранить подробный результат с координатами и диагностикой')
     parser.add_argument('--no-page-text', action='store_true',
-                        help='Не включать полный текст страниц; значения полей читаются как обычно')
+                        help='Не включать полный текст страниц в режиме --detailed')
     args = parser.parse_args()
     output = args.output or args.pdf.with_suffix('.python.json')
     if output.resolve() == args.pdf.resolve():
         parser.error('Выходной файл не должен совпадать с исходным PDF')
     try:
         data = parse(args.pdf, args.template, OCR(args.lang, args.tessdata),
-                     include_page_text=not args.no_page_text)
+                     include_page_text=args.detailed and not args.no_page_text)
+        exported = data if args.detailed else to_answers(data)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        output.write_text(json.dumps(exported, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f'Ошибка: {error}', file=sys.stderr)
         return 1
     print(f'JSON: {output}')
     if data['extraction']['needs_review']:
-        print('Есть неоднозначные поля. См. extraction.review.', file=sys.stderr)
+        labels = {field['id']: field['label'] for section in data['sections']
+                  for field in section['fields']}
+        print('Есть неоднозначные поля:', file=sys.stderr)
+        for item in data['extraction']['review']:
+            print(f"  Стр. {item['page']}: {labels[item['field']]}", file=sys.stderr)
+        if args.detailed:
+            print('Подробности: extraction.review.', file=sys.stderr)
+        else:
+            print('Для подробной диагностики используйте --detailed.', file=sys.stderr)
         return 2
     print('Все области прочитаны без диагностированных ошибок.')
     return 0
