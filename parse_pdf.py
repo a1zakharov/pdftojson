@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read an ID-Cloud questionnaire locally using a layout template, OCR and pixels."""
+"""Read a questionnaire locally using a layout template, OCR and pixels."""
 
 import argparse
 import copy
@@ -16,6 +16,65 @@ import pymupdf
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def usable_text(text):
+    """Reject broken PDF character maps rather than returning their control codes."""
+    return bool(text.strip()) and not any(
+        (ord(char) < 32 and char not in '\n\r\t') or char == '\ufffd'
+        for char in text)
+
+
+def clean_field_text(text):
+    # Printed form underlines can overlap a value's extraction rectangle even
+    # when the actual line sits below its visible crop.
+    text = re.sub(r'_{3,}', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def pdf_region(page, region, reference_size):
+    width, height = reference_size
+    x0, y0, x1, y1 = region
+    return pymupdf.Rect(x0 / width * page.rect.width, y0 / height * page.rect.height,
+                        x1 / width * page.rect.width, y1 / height * page.rect.height)
+
+
+def select_template(source, ocr, directory=None):
+    """Match both page count and a title anchor; never infer a layout from count alone."""
+    directory = Path(directory) if directory else ROOT / 'templates'
+    matches = []
+    with pymupdf.open(source) as document:
+        images = {}
+        recognized = {}
+        for path in sorted(directory.glob('*.json')):
+            template = json.loads(path.read_text(encoding='utf-8'))
+            anchor = template.get('match')
+            if template['page_count'] != document.page_count or not anchor:
+                continue
+            page_index = anchor['page'] - 1
+            page = document[page_index]
+            rect = pdf_region(page, anchor['region'], template['reference_size'])
+            title = page.get_text('text', clip=rect)
+            expected = anchor['text'].casefold()
+            if expected not in title.casefold():
+                cache_key = (page_index, tuple(template['reference_size']))
+                if cache_key not in images:
+                    images[cache_key] = render_page(page, template['reference_size'])
+                region_key = (cache_key, tuple(anchor['region']))
+                if region_key not in recognized:
+                    recognized[region_key] = ocr.read(crop(images[cache_key], anchor['region']))
+                title = recognized[region_key]
+            if expected in title.casefold():
+                matches.append(path)
+        if not matches:
+            raise ValueError(f'Не найден шаблон для документа ({document.page_count} стр.). '
+                             'Укажите подходящий шаблон через --template; '
+                             'для другого макета нужно создать новый шаблон.')
+    if len(matches) > 1:
+        raise ValueError('Подошло несколько шаблонов. Укажите --template: '
+                         + ', '.join(path.name for path in matches))
+    return matches[0]
 
 
 def render_page(page, reference_size):
@@ -113,15 +172,12 @@ def read_text_field(page, image, field, ocr):
     region = crop(image, field['region'])
     if float(np.mean(region < 160)) < 0.002:
         return None, 'blank', None
-    width, height = image.shape[1], image.shape[0]
-    x0, y0, x1, y1 = field['region']
-    rect = pymupdf.Rect(x0 / width * page.rect.width, y0 / height * page.rect.height,
-                        x1 / width * page.rect.width, y1 / height * page.rect.height)
-    text = page.get_text('text', clip=rect).strip()
+    rect = pdf_region(page, field['region'], (image.shape[1], image.shape[0]))
+    text = clean_field_text(page.get_text('text', clip=rect))
     method = 'pdf_text'
-    if not text:
+    if not usable_text(text):
         text, method = ocr.read(region, field.get('psm', 7)), 'tesseract'
-    text = re.sub(r'[ \t]+', ' ', text).strip()
+    text = clean_field_text(text)
     if not text:
         return None, method, 'unrecognized_text'
     if field.get('pattern') and not re.fullmatch(field['pattern'], text):
@@ -130,6 +186,8 @@ def read_text_field(page, image, field, ocr):
 
 
 def parse(source, template_path, ocr, include_page_text=True):
+    if template_path is None:
+        template_path = select_template(source, ocr)
     template = json.loads(Path(template_path).read_text(encoding='utf-8'))
     result = {key: copy.deepcopy(template[key])
               for key in ('title', 'brand', 'product', 'language', 'sections', 'footer')}
@@ -152,7 +210,7 @@ def parse(source, template_path, ocr, include_page_text=True):
                 text = page.get_text('text').strip()
                 method = 'pdf_text'
                 # Sparse layers may contain only a date and checkbox marks.
-                if sum(char.isalpha() for char in text) < 50:
+                if not usable_text(text) or sum(char.isalpha() for char in text) < 200:
                     text, method = ocr.read(image, psm=3), 'tesseract'
                 result['extraction']['page_text'].append(
                     {'page': index + 1, 'method': method, 'text': text})
@@ -192,7 +250,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('pdf', type=Path)
     parser.add_argument('-o', '--output', type=Path)
-    parser.add_argument('--template', type=Path, default=ROOT / 'templates/id_cloud.json')
+    parser.add_argument('--template', type=Path,
+                        help='Путь к шаблону; по умолчанию определяется по заголовку и числу страниц')
     parser.add_argument('--lang', default='rus+eng')
     local_models = ROOT / '.tessdata'
     parser.add_argument('--tessdata', type=Path,

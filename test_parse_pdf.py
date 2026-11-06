@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 import pymupdf
 
-from parse_pdf import OCR, ROOT, parse, read_checkbox
+from parse_pdf import (OCR, ROOT, clean_field_text, parse, read_checkbox,
+                       select_template, usable_text)
 
 
 class CheckboxTests(unittest.TestCase):
@@ -42,6 +43,98 @@ class CheckboxTests(unittest.TestCase):
         reading = read_checkbox(image, [0, 0, 40, 40])
         self.assertIsNone(reading['checked'])
         self.assertEqual(reading['issue'], 'ambiguous_checkbox')
+
+
+class TextTests(unittest.TestCase):
+    def test_form_underline_is_not_part_of_the_value(self):
+        self.assertEqual(clean_field_text('________________\n01.02.2026'), '01.02.2026')
+        self.assertEqual(clean_field_text('________\n123-456\n'), '123-456')
+
+    def test_broken_character_map_requires_ocr(self):
+        self.assertFalse(usable_text('\u0010=:5B0 On-prem'))
+        self.assertTrue(usable_text('Анкета On-prem\nНазвание компании'))
+
+
+class NoOCR:
+    def read(self, image, psm=6):
+        raise AssertionError('This generated PDF should be readable without OCR')
+
+
+class LayoutTests(unittest.TestCase):
+    def make_form(self, directory, template_name, title):
+        template_path = ROOT / 'templates' / template_name
+        template = json.loads(template_path.read_text(encoding='utf-8'))
+        source = Path(directory) / 'unrelated-filename.pdf'
+        # A generated blank form exercises the entire parser without committing
+        # real questionnaires or customer contact details to the repository.
+        with pymupdf.open() as document:
+            for _ in range(template['page_count']):
+                document.new_page(width=1548, height=2200)
+            document[0].insert_text((120, 350), title, fontsize=30)
+            for section in template['sections']:
+                page = document[section['page'] - 1]
+                for field in section['fields']:
+                    if field['type'] == 'checkboxes':
+                        for i, region in enumerate(field['regions']):
+                            x0, y0, x1, y1 = region
+                            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                            page.draw_rect(pymupdf.Rect(cx - 10, cy - 10, cx + 10, cy + 10),
+                                           color=(0, 0, 0), width=1.5)
+                            if field['id'] == 'windows_versions' and i == 1:
+                                page.draw_circle(pymupdf.Point(cx, cy), 7,
+                                                 color=(0, 0, 0), fill=(0, 0, 0))
+                    elif field['id'] == 'completion_date':
+                        page.insert_text((1160, 802), '01.02.2026', fontsize=30)
+            document.save(source)
+        return source
+
+    def test_four_page_form_is_selected_and_parsed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.make_form(folder, 'id_onprem.json', 'On-prem')
+            actual = parse(source, None, NoOCR(), include_page_text=False)
+        self.assertEqual(actual['page_count'], 4)
+        self.assertEqual(actual['extraction']['template'], 'id_onprem.json')
+        self.assertEqual(actual['extraction']['review'], [])
+        values = {f['id']: f['value'] for s in actual['sections'] for f in s['fields']}
+        self.assertEqual(len(values), 42)
+        self.assertEqual(values['windows_versions'], ['10'])
+        self.assertEqual(values['completion_date'], '01.02.2026')
+
+    def test_three_page_form_still_works(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.make_form(folder, 'id_cloud.json', 'Cloud')
+            actual = parse(source, None, NoOCR(), include_page_text=False)
+        self.assertEqual(actual['page_count'], 3)
+        self.assertEqual(actual['extraction']['template'], 'id_cloud.json')
+        self.assertEqual(actual['extraction']['review'], [])
+
+    def test_page_count_alone_does_not_select_a_template(self):
+        class UnknownTitle:
+            def read(self, image, psm=6):
+                return 'A different questionnaire'
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'unknown.pdf'
+            with pymupdf.open() as document:
+                for _ in range(4):
+                    document.new_page(width=1548, height=2200)
+                document.save(source)
+            with self.assertRaisesRegex(ValueError, 'Не найден шаблон'):
+                select_template(source, UnknownTitle())
+
+    def test_scanned_title_uses_ocr(self):
+        class ScannedTitle:
+            def read(self, image, psm=6):
+                return 'Анкета On-prem'
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'scan.pdf'
+            with pymupdf.open() as document:
+                for _ in range(4):
+                    document.new_page(width=1548, height=2200)
+                document.save(source)
+            selected = select_template(source, ScannedTitle())
+        self.assertEqual(selected.name, 'id_onprem.json')
 
 
 class QuestionnaireTests(unittest.TestCase):
