@@ -2,4 +2,6 @@
 .tessdata/
 __pycache__/
 tmp/
-*.python.json
+*.pdf
+*.json
+!templates/*.json
