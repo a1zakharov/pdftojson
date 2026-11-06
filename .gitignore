@@ -1,0 +1,5 @@
+.venv/
+.tessdata/
+__pycache__/
+tmp/
+*.python.json
