@@ -90,10 +90,10 @@ class LayoutTests(unittest.TestCase):
 
     def test_four_page_form_is_selected_and_parsed(self):
         with tempfile.TemporaryDirectory() as folder:
-            source = self.make_form(folder, 'id_onprem.json', 'On-prem')
+            source = self.make_form(folder, 'onprem.json', 'On-prem')
             actual = parse(source, None, NoOCR(), include_page_text=False)
         self.assertEqual(actual['page_count'], 4)
-        self.assertEqual(actual['extraction']['template'], 'id_onprem.json')
+        self.assertEqual(actual['extraction']['template'], 'onprem.json')
         self.assertEqual(actual['extraction']['review'], [])
         values = {f['id']: f['value'] for s in actual['sections'] for f in s['fields']}
         self.assertEqual(len(values), 42)
@@ -102,10 +102,10 @@ class LayoutTests(unittest.TestCase):
 
     def test_three_page_form_still_works(self):
         with tempfile.TemporaryDirectory() as folder:
-            source = self.make_form(folder, 'id_cloud.json', 'Cloud')
+            source = self.make_form(folder, 'cloud.json', 'Cloud')
             actual = parse(source, None, NoOCR(), include_page_text=False)
         self.assertEqual(actual['page_count'], 3)
-        self.assertEqual(actual['extraction']['template'], 'id_cloud.json')
+        self.assertEqual(actual['extraction']['template'], 'cloud.json')
         self.assertEqual(actual['extraction']['review'], [])
 
     def test_page_count_alone_does_not_select_a_template(self):
@@ -134,7 +134,7 @@ class LayoutTests(unittest.TestCase):
                     document.new_page(width=1548, height=2200)
                 document.save(source)
             selected = select_template(source, ScannedTitle())
-        self.assertEqual(selected.name, 'id_onprem.json')
+        self.assertEqual(selected.name, 'onprem.json')
 
 
 class QuestionnaireTests(unittest.TestCase):
@@ -145,7 +145,7 @@ class QuestionnaireTests(unittest.TestCase):
         if not cls.source.exists() or not cls.reference.exists():
             raise unittest.SkipTest('Для интеграционных проверок нужны исходные PDF и JSON')
         cls.ocr = OCR(tessdata=ROOT / '.tessdata')
-        cls.template = ROOT / 'templates/id_cloud.json'
+        cls.template = ROOT / 'templates/cloud.json'
 
     @staticmethod
     def values(data):
